@@ -3,13 +3,14 @@
 measure_dns.py — ISP-Agnostic DNS Censorship Measurement Tool
 ══════════════════════════════════════════════════════════════
 Uses dnspython for all DNS queries. Works on any ISP, any OS.
-Auto-detects your system DNS resolver and compares its responses
-against a control resolver (1.1.1.1) to identify DNS-based blocking.
+Detects your ISP's DNS resolver as the default gateway (instead of system
+DNS settings) and compares its responses against a control resolver (1.1.1.1)
+to identify DNS-based blocking.
 
 Optionally stores every piece of raw data in PostgreSQL (--db flag).
 
 Usage:
-    python measure_dns.py                           # auto-detect resolver
+    python measure_dns.py                           # auto-detect resolver (gateway)
     python measure_dns.py --resolver 192.168.1.1    # manual resolver
     python measure_dns.py --label MyISP             # custom label for output
     python measure_dns.py --db postgresql://u:p@h/db # persist to PostgreSQL
@@ -225,13 +226,126 @@ def query_a(resolver_ip, domain, timeout=None):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  Resolver detection (cross-platform)
+#  Resolver detection — now uses default gateway (not system DNS)
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _is_valid_ip(s):
+    try:
+        ipaddress.ip_address(s)
+        return True
+    except ValueError:
+        return False
+
+
+def _detect_gateway_linux():
+    """Get default gateway IP on Linux."""
+    try:
+        # Try `ip route show default`
+        result = subprocess.run(
+            ["ip", "route", "show", "default"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            # typical output: default via 192.168.1.1 dev eth0
+            match = re.search(r"default via ([\d.]+)", result.stdout)
+            if match:
+                return match.group(1)
+        # Fallback to `route -n`
+        result = subprocess.run(
+            ["route", "-n"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == "0.0.0.0":
+                return parts[1]  # gateway
+    except Exception:
+        pass
+    return None
+
+
+def _detect_gateway_macos():
+    """Get default gateway IP on macOS."""
+    try:
+        # `route -n get default` gives gateway
+        result = subprocess.run(
+            ["route", "-n", "get", "default"],
+            capture_output=True, text=True, timeout=5
+        )
+        # output contains "gateway: 192.168.1.1"
+        match = re.search(r"gateway:\s*([\d.]+)", result.stdout)
+        if match:
+            return match.group(1)
+        # Alternative: netstat -rn
+        result = subprocess.run(
+            ["netstat", "-rn"],
+            capture_output=True, text=True, timeout=5
+        )
+        for line in result.stdout.splitlines():
+            if "default" in line:
+                parts = line.split()
+                # typical: default 192.168.1.1 ...
+                if len(parts) >= 2:
+                    return parts[1]
+    except Exception:
+        pass
+    return None
+
+
+def _detect_gateway_windows():
+    """Get default gateway IP on Windows."""
+    try:
+        # PowerShell: Get-NetRoute -DestinationPrefix "0.0.0.0/0" | Select-Object -ExpandProperty NextHop
+        result = subprocess.run(
+            ["powershell", "-Command",
+             "Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Select-Object -ExpandProperty NextHop"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            ip = result.stdout.strip()
+            if _is_valid_ip(ip):
+                return ip
+        # Fallback: route print
+        result = subprocess.run(
+            ["route", "print", "0.0.0.0"],
+            capture_output=True, text=True, timeout=5
+        )
+        # Look for line with 0.0.0.0 and gateway
+        for line in result.stdout.splitlines():
+            if "0.0.0.0" in line:
+                parts = line.split()
+                # typical: 0.0.0.0 0.0.0.0 192.168.1.1 192.168.1.100
+                if len(parts) >= 3:
+                    ip = parts[2] if len(parts) > 2 else None
+                    if ip and _is_valid_ip(ip):
+                        return ip
+    except Exception:
+        pass
+    return None
+
+
 def detect_resolver():
-    """Auto-detect the system's DNS resolver IP (Windows / Linux / macOS)."""
-    resolvers = []
+    """
+    Detect ISP's DNS resolver as the default gateway.
+    If gateway detection fails, fall back to system DNS settings with a warning.
+    """
     system = platform.system().lower()
+    gateway = None
+
+    if system == "windows":
+        gateway = _detect_gateway_windows()
+    elif system == "darwin":
+        gateway = _detect_gateway_macos()
+    else:  # linux and others
+        gateway = _detect_gateway_linux()
+
+    if gateway:
+        print(f"[INFO] Using default gateway {gateway} as DNS resolver (assumed ISP DNS).")
+        return gateway
+
+    # Fallback to original detection (system DNS) with a warning
+    print("[WARN] Could not detect default gateway. Falling back to system DNS resolver detection.")
+    resolvers = []
     if system == "windows":
         resolvers = _detect_windows()
     else:
@@ -244,6 +358,7 @@ def detect_resolver():
     return resolvers[0] if resolvers else None
 
 
+# ── Original system DNS detection functions (kept for fallback) ───────────────
 def _detect_windows():
     servers = []
     try:
@@ -300,14 +415,6 @@ def _detect_macos_scutil():
     except Exception:
         pass
     return servers
-
-
-def _is_valid_ip(s):
-    try:
-        ipaddress.ip_address(s)
-        return True
-    except ValueError:
-        return False
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1037,7 +1144,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python measure_dns.py                               # auto-detect everything
+  python measure_dns.py                               # auto-detect everything (gateway)
   python measure_dns.py --resolver 192.168.1.1        # specify resolver
   python measure_dns.py --label BSNL                  # custom label
   python measure_dns.py --db postgresql://u:p@h/db    # persist to PostgreSQL
@@ -1046,7 +1153,7 @@ Examples:
         """,
     )
     parser.add_argument("--resolver", default=None,
-                        help="ISP resolver IP (default: auto-detect)")
+                        help="ISP resolver IP (default: auto-detect gateway)")
     parser.add_argument("--control", default=CONTROL_RESOLVER,
                         help=f"Control resolver IP (default: {CONTROL_RESOLVER})")
     parser.add_argument("--label", default=None,
@@ -1100,7 +1207,7 @@ Examples:
     if not resolver:
         resolver = detect_resolver()
     if not resolver:
-        print("[ERROR] Could not detect system DNS resolver.")
+        print("[ERROR] Could not detect DNS resolver.")
         print("        Use --resolver <IP> to specify manually.")
         sys.exit(1)
 
