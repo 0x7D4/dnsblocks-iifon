@@ -17,11 +17,11 @@ Database configuration (via .env file or environment variables):
     DB_PORT=5432
 
 Usage:
-    python measure_dns.py                           # auto-detect resolver (gateway)
-    python measure_dns.py --resolver 192.168.1.1    # specify resolver
-    python measure_dns.py --label MyISP             # custom label for output
-    python measure_dns.py --db                       # persist to PostgreSQL (uses env vars)
-    python measure_dns.py --analyze --db             # cross-ISP analysis
+    python measure_dns.py                               # auto-detect resolver (gateway)
+    python measure_dns.py --resolver 192.168.1.1        # specify resolver
+    python measure_dns.py --label MyISP                  # custom label for output
+    python measure_dns.py --db                           # persist to PostgreSQL (uses DB_* env vars)
+    python measure_dns.py --analyze --db                 # cross-ISP analysis
 
 Requirements:
     pip install dnspython tqdm
@@ -626,11 +626,11 @@ def run_measurement(domains, resolver, label):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PostgreSQL — Connection from environment variables
+#  PostgreSQL — Connection from environment variables (using keyword parameters)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def construct_db_connection():
-    """Build PostgreSQL connection string from environment variables."""
+def db_connect():
+    """Connect to PostgreSQL using individual parameters (avoids URL encoding issues)."""
     user = os.environ.get("DB_USER")
     password = os.environ.get("DB_PASSWORD")
     dbname = os.environ.get("DB_NAME")
@@ -638,9 +638,48 @@ def construct_db_connection():
     port = os.environ.get("DB_PORT", "5432")
 
     if not all([user, password, dbname]):
+        print("[ERROR] Database connection failed: Missing DB_USER, DB_PASSWORD, or DB_NAME environment variables.")
+        print("Please set these variables in your .env file or environment.")
         return None
 
-    return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+    try:
+        import psycopg2
+    except ImportError:
+        print("[INFO] Installing psycopg2-binary...")
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "psycopg2-binary", "-q"],
+            capture_output=True,
+        )
+        import psycopg2
+
+    try:
+        # Connect using keyword parameters - handles special characters automatically
+        conn = psycopg2.connect(
+            user=user,
+            password=password,
+            dbname=dbname,
+            host=host,
+            port=port
+        )
+        conn.autocommit = False
+        print(f"[DB]   Successfully connected to PostgreSQL at {host}:{port}/{dbname}")
+        return conn
+    except psycopg2.OperationalError as e:
+        print(f"[ERROR] Could not connect to database: {e}")
+        print("\n[TROUBLESHOOTING]")
+        print("  1. Verify PostgreSQL is running: sudo systemctl status postgresql (Linux)")
+        print("  2. Check if the database exists: sudo -u postgres psql -l")
+        print("  3. Verify user permissions: sudo -u postgres psql -c \"\\du\"")
+        print("  4. Check pg_hba.conf for connection permissions")
+        print("\n   Connection parameters:")
+        print(f"     Host: {host}")
+        print(f"     Port: {port}")
+        print(f"     User: {user}")
+        print(f"     Database: {dbname}")
+        return None
+    except Exception as e:
+        print(f"[ERROR] Unexpected database error: {e}")
+        return None
 
 
 SCHEMA_SQL = """
@@ -785,32 +824,6 @@ CREATE TABLE IF NOT EXISTS blocklist_changes (
 );
 CREATE INDEX IF NOT EXISTS idx_changes_runs ON blocklist_changes(run_old_id, run_new_id);
 """
-
-
-def db_connect():
-    """Connect to PostgreSQL using environment variables."""
-    connstr = construct_db_connection()
-    if not connstr:
-        print("[ERROR] Database connection failed: Missing DB_USER, DB_PASSWORD, or DB_NAME environment variables.")
-        return None
-
-    try:
-        import psycopg2
-    except ImportError:
-        print("[INFO] Installing psycopg2-binary...")
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", "psycopg2-binary", "-q"],
-            capture_output=True,
-        )
-        import psycopg2
-
-    try:
-        conn = psycopg2.connect(connstr)
-        conn.autocommit = False
-        return conn
-    except Exception as e:
-        print(f"[ERROR] Could not connect to database: {e}")
-        return None
 
 
 def db_init(conn):
