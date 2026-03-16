@@ -9,12 +9,19 @@ to identify DNS-based blocking.
 
 Optionally stores every piece of raw data in PostgreSQL (--db flag).
 
+Database configuration (via .env file or environment variables):
+    DB_USER=your_user
+    DB_PASSWORD=your_password
+    DB_NAME=your_database
+    DB_HOST=localhost
+    DB_PORT=5432
+
 Usage:
     python measure_dns.py                           # auto-detect resolver (gateway)
-    python measure_dns.py --resolver 192.168.1.1    # manual resolver
+    python measure_dns.py --resolver 192.168.1.1    # specify resolver
     python measure_dns.py --label MyISP             # custom label for output
-    python measure_dns.py --db postgresql://u:p@h/db # persist to PostgreSQL
-    python measure_dns.py --analyze --db ...         # cross-ISP analysis
+    python measure_dns.py --db                       # persist to PostgreSQL (uses env vars)
+    python measure_dns.py --analyze --db             # cross-ISP analysis
 
 Requirements:
     pip install dnspython tqdm
@@ -37,7 +44,7 @@ from collections import Counter, namedtuple
 from datetime import datetime, timezone
 from pathlib import Path
 
-# ── Load .env file (DATABASE_URL, etc.) ───────────────────────────────────────
+# ── Load .env file (DB_USER, DB_PASSWORD, etc.) ──────────────────────────────
 try:
     from dotenv import load_dotenv
     # Look for .env next to the script, then in cwd
@@ -619,8 +626,22 @@ def run_measurement(domains, resolver, label):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PostgreSQL — Schema & DB functions
+#  PostgreSQL — Connection from environment variables
 # ══════════════════════════════════════════════════════════════════════════════
+
+def construct_db_connection():
+    """Build PostgreSQL connection string from environment variables."""
+    user = os.environ.get("DB_USER")
+    password = os.environ.get("DB_PASSWORD")
+    dbname = os.environ.get("DB_NAME")
+    host = os.environ.get("DB_HOST", "localhost")
+    port = os.environ.get("DB_PORT", "5432")
+
+    if not all([user, password, dbname]):
+        return None
+
+    return f"postgresql://{user}:{password}@{host}:{port}/{dbname}"
+
 
 SCHEMA_SQL = """
 -- ── Measurement tables ───────────────────────────────────────────────────────
@@ -766,8 +787,13 @@ CREATE INDEX IF NOT EXISTS idx_changes_runs ON blocklist_changes(run_old_id, run
 """
 
 
-def db_connect(connstr):
-    """Connect to PostgreSQL. Auto-installs psycopg2-binary if needed."""
+def db_connect():
+    """Connect to PostgreSQL using environment variables."""
+    connstr = construct_db_connection()
+    if not connstr:
+        print("[ERROR] Database connection failed: Missing DB_USER, DB_PASSWORD, or DB_NAME environment variables.")
+        return None
+
     try:
         import psycopg2
     except ImportError:
@@ -777,9 +803,14 @@ def db_connect(connstr):
             capture_output=True,
         )
         import psycopg2
-    conn = psycopg2.connect(connstr)
-    conn.autocommit = False
-    return conn
+
+    try:
+        conn = psycopg2.connect(connstr)
+        conn.autocommit = False
+        return conn
+    except Exception as e:
+        print(f"[ERROR] Could not connect to database: {e}")
+        return None
 
 
 def db_init(conn):
@@ -1147,9 +1178,15 @@ Examples:
   python measure_dns.py                               # auto-detect everything (gateway)
   python measure_dns.py --resolver 192.168.1.1        # specify resolver
   python measure_dns.py --label BSNL                  # custom label
-  python measure_dns.py --db postgresql://u:p@h/db    # persist to PostgreSQL
-  python measure_dns.py --analyze --db postgresql://...# cross-ISP analysis
-  python measure_dns.py --workers 20 --batch 100      # tune concurrency
+  python measure_dns.py --db                           # persist to PostgreSQL (uses DB_* env vars)
+  python measure_dns.py --analyze --db                 # cross-ISP analysis
+
+Database environment variables (in .env or system):
+  DB_USER=your_user
+  DB_PASSWORD=your_password
+  DB_NAME=your_database
+  DB_HOST=localhost
+  DB_PORT=5432
         """,
     )
     parser.add_argument("--resolver", default=None,
@@ -1172,8 +1209,8 @@ Examples:
                         help="Output CSV path (default: results/<label>_results.csv)")
     parser.add_argument("--skip-detect", action="store_true",
                         help="Skip block-IP auto-detection")
-    parser.add_argument("--db", default=os.environ.get("DATABASE_URL"),
-                        help="PostgreSQL connection string (default: DATABASE_URL from .env)")
+    parser.add_argument("--db", action="store_true",
+                        help="Enable PostgreSQL storage (uses DB_* environment variables)")
     parser.add_argument("--analyze", action="store_true",
                         help="Run cross-ISP analysis on existing DB runs")
     args = parser.parse_args()
@@ -1189,14 +1226,18 @@ Examples:
     # ── Database connection (optional) ────────────────────────────────────────
     conn = None
     if args.db:
-        conn = db_connect(args.db)
-        db_init(conn)
-        print(f"[DB]   Connected to PostgreSQL.")
+        conn = db_connect()
+        if conn:
+            db_init(conn)
+            print(f"[DB]   Connected to PostgreSQL.")
+        else:
+            print("[ERROR] Database connection failed. Check your DB_* environment variables.")
+            sys.exit(1)
 
     # ── Analysis-only mode ────────────────────────────────────────────────────
     if args.analyze:
         if not conn:
-            print("[ERROR] --analyze requires --db <connection-string>")
+            print("[ERROR] --analyze requires --db and valid DB_* environment variables")
             sys.exit(1)
         run_analysis(conn)
         conn.close()
